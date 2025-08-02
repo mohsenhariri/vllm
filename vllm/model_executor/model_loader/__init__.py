@@ -13,6 +13,7 @@ from vllm.model_executor.model_loader.bitsandbytes_loader import (
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
+from vllm.model_executor.model_loader.df11_loader import DF11ModelLoader
 from vllm.model_executor.model_loader.runai_streamer_loader import (
     RunaiModelStreamerLoader)
 from vllm.model_executor.model_loader.sharded_state_loader import (
@@ -31,6 +32,7 @@ LoadFormats = Literal[
     "dummy",
     "fastsafetensors",
     "gguf",
+    "df11",
     "mistral",
     "npcache",
     "pt",
@@ -46,6 +48,7 @@ _LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
     "dummy": DummyModelLoader,
     "fastsafetensors": DefaultModelLoader,
     "gguf": GGUFModelLoader,
+    "df11": DF11ModelLoader,
     "mistral": DefaultModelLoader,
     "npcache": DefaultModelLoader,
     "pt": DefaultModelLoader,
@@ -129,6 +132,7 @@ __all__ = [
     "BaseModelLoader",
     "BitsAndBytesModelLoader",
     "GGUFModelLoader",
+    "DF11ModelLoader",
     "DefaultModelLoader",
     "DummyModelLoader",
     "RunaiModelStreamerLoader",
