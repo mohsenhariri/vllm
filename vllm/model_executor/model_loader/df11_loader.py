@@ -11,15 +11,15 @@ import torch.nn as nn
 from safetensors.torch import load_file
 from tqdm import tqdm
 from transformers.models.auto.configuration_auto import AutoConfig
-from transformers.modeling_utils import no_init_weights
 from huggingface_hub import snapshot_download
 
-from vllm.config import LoadConfig, ModelConfig
+from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
 
 
-# Add path to DF11 object file or install df11_v2 globally 
+# Add local path for now
 df11_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "DF11")
 if df11_path not in sys.path:
     sys.path.insert(0, df11_path)
@@ -34,11 +34,11 @@ class TensorManager:
     Static utility class that manages tensor allocation and reuse
     to minimize memory allocation overhead during tensor reconstruction.
     """
-    # Static class variable to store tensors for each device
+    # Static class variables to store tensors
     _tensors = {}  # Maps device to tensor
 
     @staticmethod
-    def get_tensor(device, n_elements):
+    def allocate_bfloat16(device, n_elements):
         """
         Get a bfloat16 tensor with at least n_elements on the specified device.
 
@@ -118,12 +118,25 @@ def get_hook(threads_per_block, bytes_per_thread):
     threads_per_block = tuple(threads_per_block)
 
     def decode_hook(module: nn.Module, _):
+        device = module.luts.device
+        
+        # Load offloaded tensors to GPU if not already there
+        if hasattr(module, 'offloaded_tensors'):
+            for tensor_name, tensor in module.offloaded_tensors.items():
+                if not (
+                    hasattr(module, tensor_name) and (getattr(module, tensor_name).device == device)
+                ):
+                    module.register_buffer(tensor_name, tensor.to(device, non_blocking=True))
+
+        # Get dimensions for tensor reconstruction
         n_elements = module.sign_mantissa.numel()
         n_bytes = module.encoded_exponent.numel()
         n_luts = module.luts.shape[0]
-        device = module.encoded_exponent.device
-        out = TensorManager.get_tensor(device, n_elements)
+        
+        # Get output tensor for reconstructed weights
+        reconstructed = TensorManager.allocate_bfloat16(device, n_elements)
 
+        # Configure CUDA grid dimensions for the kernel launch
         blocks_per_grid = (
             int(math.ceil(n_bytes / (threads_per_block[0] * bytes_per_thread))),
         )
@@ -134,7 +147,7 @@ def get_hook(threads_per_block, bytes_per_thread):
             module.sign_mantissa.data_ptr(),
             module.output_positions.data_ptr(),
             module.gaps.data_ptr(),
-            out.data_ptr(),
+            reconstructed.data_ptr(),
             n_luts,
             n_bytes,
             n_elements,
@@ -142,17 +155,44 @@ def get_hook(threads_per_block, bytes_per_thread):
             threads_per_block[0],
             module.shared_mem_size,
         )
-
-
+        
         # Inject reconstructed weights into the appropriate module
         if isinstance(module, nn.Linear):
-            module.weight = out.view(module.out_features, module.in_features)
-        elif isinstance(module, nn.Embedding):
-            module.weight = out.view(module.num_embeddings, module.embedding_dim)
-        else:  # merged module split across sub-modules
-            weights = torch.tensor_split(out, module.split_positions)
-            for sub_mod, w in zip(module.weight_injection_modules, weights):
-                sub_mod.weight = w.view(sub_mod.out_features, sub_mod.in_features)
+            logger.debug(f"DF11: Linear module - setting weight with shape {module.out_features}x{module.in_features}")
+            module.weight = reconstructed.view(
+                module.out_features, module.in_features
+            )
+        elif isinstance(module, ParallelLMHead):
+            logger.debug(f"DF11: ParallelLMHead - setting _df11_weight with shape {module.num_embeddings}x{module.embedding_dim}")
+            module._df11_weight = reconstructed.view(
+                module.num_embeddings, module.embedding_dim
+            )
+        elif isinstance(module, (nn.Embedding, VocabParallelEmbedding)):
+            logger.debug(f"DF11: Embedding-like module - setting weight with shape {module.num_embeddings}x{module.embedding_dim}")
+            module.weight = reconstructed.view(
+                module.num_embeddings, module.embedding_dim
+            )
+        elif hasattr(module, 'weight_injection_modules'):
+            # Handle special case where weights need to be split across multiple submodules
+            weights = torch.tensor_split(reconstructed, module.split_positions)
+            for sub_module, weight in zip(module.weight_injection_modules, weights):
+                sub_module.weight = weight.view(sub_module.out_features, sub_module.in_features)
+        else:
+            # Fallback: try to find out_features and in_features attributes
+            if hasattr(module, 'out_features') and hasattr(module, 'in_features'):
+                module.weight = reconstructed.view(module.out_features, module.in_features)
+            elif hasattr(module, 'num_embeddings') and hasattr(module, 'embedding_dim'):
+                module.weight = reconstructed.view(module.num_embeddings, module.embedding_dim)
+            else:
+                logger.error(f"DF11: Unknown module type {type(module).__name__} for weight injection")
+
+        # Delete tensors from GPU if offloading is enabled
+        if hasattr(module, 'offloaded_tensors'):
+            for tensor_name in module.offloaded_tensors.keys():
+                if hasattr(module, tensor_name):
+                    tmp = getattr(module, tensor_name)
+                    delattr(module, tensor_name)
+                    del tmp
 
     return decode_hook
 
@@ -170,6 +210,7 @@ class DF11ModelLoader(BaseModelLoader):
 
 
     def download_model(self, model_config: ModelConfig) -> None:
+        # will find a better way to handle it, prob chaing the df11 config file
         model_path = model_config.model
         if os.path.exists(model_path):
             return
@@ -223,16 +264,69 @@ class DF11ModelLoader(BaseModelLoader):
                 op = comp["output_positions"]
                 op_u32 = op.view(torch.uint32)
 
-                # fix
-                # torch does not implement arithmetic for unsigned dtypes, so cast
-                # to int64 before the subtraction.
+                # casting
                 diff_max = (op_u32[1:].to(torch.int64) - op_u32[:-1].to(torch.int64)).max().item()
                 shared_mem = threads_per_block[0] * 4 + 4 + diff_max * 2
                 module.shared_mem_size = shared_mem 
-            # Prepare weight removal / multi-sub-module case
-            self.prepare_weight_injection(module, layer_path, pattern_dict)
-            # Hook
-            module.register_forward_pre_hook(decode_hook)
+            
+            # Set up decompression for encoded weights (v2)
+            if "encoded_exponent" in comp:
+                
+                # Register the decode hook to decompress weights during forward pass
+                module.register_forward_pre_hook(decode_hook)
+
+                # Configure weight injection based on module type
+                pattern_matched = False
+                for pattern, attr_names in pattern_dict.items():
+                    if re.fullmatch(pattern, layer_path):
+                        pattern_matched = True                        
+                        
+                        # Check ParallelLMHead first since it inherits from VocabParallelEmbedding
+                        if isinstance(module, ParallelLMHead):
+                            if hasattr(module, 'weight'):
+                                tmp = module.weight
+                                delattr(module, 'weight')
+                                del tmp
+                            
+                            # Create a property that triggers reconstruction when accessed
+                            def weight_property(self):
+                                # Trigger the decode hook manually
+                                decode_hook(self, None)
+                                # Return the reconstructed weight
+                                return self._df11_weight
+                            
+                            # Add the property to the instance
+                            module.__class__.weight = property(weight_property)
+                        elif isinstance(module, (nn.Embedding, VocabParallelEmbedding)):
+                            # Remove weight attribute from embedding layer
+                            if hasattr(module, 'weight'):
+                                tmp = module.weight
+                                delattr(module, 'weight')
+                                del tmp
+                        elif isinstance(module, nn.Linear):
+                            # Remove weight attribute from linear layer  
+                            if hasattr(module, 'weight'):
+                                tmp = module.weight
+                                delattr(module, 'weight')
+                                del tmp
+                        else:
+                            # Handle special case for multi-module weight injection
+                            setattr(module, 'weight_injection_modules', [])
+                            for attr_path in attr_names:
+                                parts = attr_path.split('.')
+                                target = module
+                                for p in parts:
+                                    target = getattr(target, p)
+
+                                if hasattr(target, 'weight'):
+                                    tmp = target.weight
+                                    delattr(target, 'weight')
+                                    del tmp
+                                module.weight_injection_modules.append(target)
+                        break
+                
+                if not pattern_matched:
+                    print(f"DF11: WARNING - No pattern matched for {layer_path}, module type: {type(module).__name__}", flush=True)
 
         # move everything to the desired single GPU
         target = self.load_config.device or "cuda"
@@ -259,19 +353,30 @@ class DF11ModelLoader(BaseModelLoader):
 
     @staticmethod
     def prepare_weight_injection(module: nn.Module, layer_path: str, pattern_dict: Dict[str, List[str]]):
-        # Find pattern match (if any)
+        logger.debug(f"DF11: Preparing weight injection for {layer_path}, module type: {type(module).__name__}")
+        
+        # Find pattern match
         matched_attrs: List[str] | None = None
         for pattern, attrs in pattern_dict.items():
             if re.fullmatch(pattern, layer_path):
                 matched_attrs = attrs
+                logger.debug(f"DF11: Pattern '{pattern}' matched for {layer_path} with attrs: {attrs}")
                 break
-        if isinstance(module, (nn.Linear, nn.Embedding)):
+        if isinstance(module, (nn.Linear, nn.Embedding, VocabParallelEmbedding, ParallelLMHead)):
+            logger.debug(f"DF11: Standard module ({type(module).__name__}) - removing weight attribute")
             if hasattr(module, "weight"):
                 delattr(module, "weight")
             return
         # merged module: holds multiple Linear sub-modules
         if matched_attrs is None:
             logger.warning("Compressed module %s not matched in pattern_dict", layer_path)
+            logger.debug(f"DF11: Available patterns: {list(pattern_dict.keys())}")
+            return
+        # Check if pattern has empty attributes list (treat as standard module)
+        if not matched_attrs:  # Empty list means it's a standard module like embed_tokens or lm_head
+            logger.debug(f"DF11: Pattern matched with empty attrs - treating as standard module")
+            if hasattr(module, "weight"):
+                delattr(module, "weight")
             return
         module.weight_injection_modules = [] 
         for attr_path in matched_attrs:
