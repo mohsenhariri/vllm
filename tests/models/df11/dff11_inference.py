@@ -1,10 +1,7 @@
 import torch
 import os
 
-# Toggle between V0 and V1, it works for both cases.
-# os.environ["VLLM_USE_V1"] = "0"
-os.environ["VLLM_USE_V1"] = "1"
-
+os.environ["VLLM_USE_V1"] = "0"
 
 from vllm import LLM, SamplingParams
 
@@ -13,15 +10,19 @@ print(f"CUDA Version: {torch.version.cuda}") # tested only with CUDA 12.6
 
 df_model_path = "DF11/weights/llama3.1-8b-it-df11"
 
+# llm = LLM(
+#     model=df_model_path,
+#     enforce_eager=True,
+#     load_format="df11", # by setting this, `DF11ModelLoader` is loaded
+#     model_impl="transformers",
+#     dtype="bfloat16"  
+# )
 
 llm = LLM(
     model=df_model_path,
-    enforce_eager=True,
     load_format="df11", # by setting this, `DF11ModelLoader` is loaded
-    model_impl="transformers",
     dtype="bfloat16"  
 )
-
 
 prompts = "What is the meaning of life?"
 

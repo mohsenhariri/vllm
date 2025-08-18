@@ -16,17 +16,24 @@ from huggingface_hub import snapshot_download
 from vllm.config import ModelConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
-from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding, ParallelLMHead
+from vllm.model_executor.model_loader.utils import (
+    initialize_model, process_weights_after_loading, set_default_torch_dtype)
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding, ParallelLMHead)
+from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.quantization.df11 import (
+    DF11LinearMethod, DF11EmbeddingMethod, DF11LinearSplitMethod)
+
+logger = init_logger(__name__)
 
 
-# Add local path for now
+# Add path to DF11 object file or install df11_v2 globally 
 df11_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))), "DF11")
 if df11_path not in sys.path:
     sys.path.insert(0, df11_path)
 
 import dfloat11_decode_v2
 
-logger = init_logger(__name__)
 
 
 class TensorManager:
@@ -250,7 +257,6 @@ class DF11ModelLoader(BaseModelLoader):
                 compressed.setdefault(layer_path, {})[component] = tvalue
 
    
-        decode_hook = get_hook(threads_per_block, bytes_per_thread)
         for layer_path, comp in compressed.items():
             module = self.resolve_module(model, layer_path)
             # Buffers
@@ -269,69 +275,174 @@ class DF11ModelLoader(BaseModelLoader):
                 shared_mem = threads_per_block[0] * 4 + 4 + diff_max * 2
                 module.shared_mem_size = shared_mem 
             
-            # Set up decompression for encoded weights (v2)
+            # Assign DF11 quantization method for modules having compressed weights
             if "encoded_exponent" in comp:
-                
-                # Register the decode hook to decompress weights during forward pass
-                module.register_forward_pre_hook(decode_hook)
+                # Determine proper DF11 method based on module type
+                # vLLM reads weights in groups
+                if isinstance(module, (VocabParallelEmbedding, ParallelLMHead)):
+                    module.quant_method = DF11EmbeddingMethod(
+                        threads_per_block=threads_per_block,
+                        bytes_per_thread=bytes_per_thread,
+                    )
+                    # Remove dense weight to prevent double memory usage
+                    if hasattr(module, "weight"):
+                        try:
+                            delattr(module, "weight")
+                        except Exception:
+                            pass
+                elif isinstance(module, LinearBase):
+                    module.quant_method = DF11LinearMethod(
+                        threads_per_block=threads_per_block,
+                        bytes_per_thread=bytes_per_thread,
+                    )
+                    if hasattr(module, "weight"):
+                        try:
+                            delattr(module, "weight")
+                        except Exception:
+                            pass
+                else:
+                    # Check merged-module case: compressed held at parent and
+                    # weights dispatched to child submodules defined by pattern.
+                    assigned = False
 
-                # Configure weight injection based on module type
-                pattern_matched = False
-                for pattern, attr_names in pattern_dict.items():
-                    if re.fullmatch(pattern, layer_path):
-                        pattern_matched = True                        
-                        
-                        # Check ParallelLMHead first since it inherits from VocabParallelEmbedding
-                        if isinstance(module, ParallelLMHead):
-                            if hasattr(module, 'weight'):
-                                tmp = module.weight
-                                delattr(module, 'weight')
-                                del tmp
-                            
-                            # Create a property that triggers reconstruction when accessed
-                            def weight_property(self):
-                                # Trigger the decode hook manually
-                                decode_hook(self, None)
-                                # Return the reconstructed weight
-                                return self._df11_weight
-                            
-                            # Add the property to the instance
-                            module.__class__.weight = property(weight_property)
-                        elif isinstance(module, (nn.Embedding, VocabParallelEmbedding)):
-                            # Remove weight attribute from embedding layer
-                            if hasattr(module, 'weight'):
-                                tmp = module.weight
-                                delattr(module, 'weight')
-                                del tmp
-                        elif isinstance(module, nn.Linear):
-                            # Remove weight attribute from linear layer  
-                            if hasattr(module, 'weight'):
-                                tmp = module.weight
-                                delattr(module, 'weight')
-                                del tmp
-                        else:
-                            # Handle special case for multi-module weight injection
-                            setattr(module, 'weight_injection_modules', [])
-                            for attr_path in attr_names:
-                                parts = attr_path.split('.')
+                    # Helper to collapse HF attr_names into vLLM fused targets
+                    def get_vllm_groups(attr_names: list[str]) -> list[tuple[str, int, int]]:
+                        """
+                        Returns a list of tuples (target_path, seg_start, seg_end)
+                        where seg_start end are indices into attr_names (not element offsets)
+                        describing contiguous segments to combine for fused modules.
+                        """
+                        name_to_idx: dict[str, int] = {name: i for i, name in enumerate(attr_names)}
+                        groups: list[tuple[str, int, int]] = []
+
+                        def get(name: str) -> int | None:
+                            return name_to_idx.get(name)
+
+                        # QKV fused
+                        qi, ki, vi = get("self_attn.q_proj"), get("self_attn.k_proj"), get("self_attn.v_proj")
+                        if qi is not None and ki is not None and vi is not None:
+                            start = min(qi, ki, vi)
+                            end = max(qi, ki, vi) + 1
+                            groups.append(("self_attn.qkv_proj", start, end))
+
+                        # o_proj
+                        oi = get("self_attn.o_proj")
+                        if oi is not None:
+                            groups.append(("self_attn.o_proj", oi, oi + 1))
+
+                        # gate_up fused
+                        gi, ui = get("mlp.gate_proj"), get("mlp.up_proj")
+                        if gi is not None and ui is not None:
+                            start = min(gi, ui)
+                            end = max(gi, ui) + 1
+                            groups.append(("mlp.gate_up_proj", start, end))
+
+                        # down_proj
+                        di = get("mlp.down_proj")
+                        if di is not None:
+                            groups.append(("mlp.down_proj", di, di + 1))
+
+                        return groups
+
+                    for pattern, attr_names in pattern_dict.items():
+                        if re.fullmatch(pattern, layer_path) and attr_names is not None:
+                            # Expect split_positions buffer with cumulative cuts.
+                            if not hasattr(module, "split_positions"):
+                                raise RuntimeError(
+                                    f"DF11: split_positions missing for merged module {layer_path}")
+                            split_positions = getattr(module, "split_positions")
+                            cuts = [0] + [int(x) for x in split_positions] + [int(module.sign_mantissa.numel())]
+
+                            # If attr_names empty -> standard module (embedding/lm_head), handle earlier
+                            if not attr_names:
+                                assigned = True
+                                break
+
+                            # Collapse HF names to vLLM fused module groups
+                            groups = get_vllm_groups(attr_names)
+
+                            if not groups:
+                                # Fall back to 1:1 mapping if nothing recognized
+                                for i, attr_path in enumerate(attr_names):
+                                    target = module
+                                    for p in attr_path.split('.'):
+                                        target = getattr(target, p)
+                                    if isinstance(target, LinearBase):
+                                        target.quant_method = DF11LinearSplitMethod(
+                                            threads_per_block=threads_per_block,
+                                            bytes_per_thread=bytes_per_thread,
+                                            parent=module,
+                                            start_index=cuts[i],
+                                            end_index=cuts[i + 1],
+                                        )
+                                        if hasattr(target, "weight"):
+                                            try:
+                                                delattr(target, "weight")
+                                            except Exception:
+                                                pass
+                                assigned = True
+                                break
+
+                            # Assign methods to fused/merged targets
+                            for target_path, seg_start, seg_end in groups:
+                                # Convert segment indices into element offsets
+                                start_elem = cuts[seg_start]
+                                end_elem = cuts[seg_end]
+
                                 target = module
-                                for p in parts:
+                                for p in target_path.split('.'):
                                     target = getattr(target, p)
 
-                                if hasattr(target, 'weight'):
-                                    tmp = target.weight
-                                    delattr(target, 'weight')
-                                    del tmp
-                                module.weight_injection_modules.append(target)
-                        break
-                
-                if not pattern_matched:
-                    print(f"DF11: WARNING - No pattern matched for {layer_path}, module type: {type(module).__name__}", flush=True)
+                                if isinstance(target, LinearBase):
+                                    target.quant_method = DF11LinearSplitMethod(
+                                        threads_per_block=threads_per_block,
+                                        bytes_per_thread=bytes_per_thread,
+                                        parent=module,
+                                        start_index=start_elem,
+                                        end_index=end_elem,
+                                    )
+                                    if hasattr(target, "weight"):
+                                        try:
+                                            delattr(target, "weight")
+                                        except Exception:
+                                            pass
+                            assigned = True
+                            break
 
-        # move everything to the desired single GPU
-        target = self.load_config.device or "cuda"
-        model.to(target)
-        logger.info("DF11 model loaded onto %s", target)
+                    if not assigned:
+                        # Fallback: try to apply as linear (other layers)
+                        module.quant_method = DF11LinearMethod(
+                            threads_per_block=threads_per_block,
+                            bytes_per_thread=bytes_per_thread,
+                        )
+
+        logger.info("DF11 weights registered and DF11 methods assigned")
+
+    def load_model(self, vllm_config, model_config: ModelConfig) -> nn.Module:
+        """Override to avoid dense GPU allocations during init.
+
+        We instantiate the model on CPU, register DF11 buffers and methods,
+        then move to the target device.
+        """
+        device_config = vllm_config.device_config
+        target_device = torch.device(
+            self.load_config.device or device_config.device or "cuda")
+
+        with set_default_torch_dtype(model_config.dtype):
+            # Initialize on CPU to avoid allocating dense GPU weights.
+            with torch.device("cpu"):
+                model = initialize_model(vllm_config=vllm_config,
+                                         model_config=model_config)
+
+            # Register DF11 buffers and df11 quant methods
+            self.load_weights(model, model_config)
+
+            # Allow quant methods to post-process
+            process_weights_after_loading(model, model_config, target_device)
+
+            # Move to target device
+            model.to(target_device)
+            return model.eval()
 
 
     @staticmethod
