@@ -13,10 +13,10 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
 from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
 from vllm.utils import direct_register_custom_op
 
+from torch._dynamo import disable as dynamo_disable, allow_in_graph as dynamo_allow_in_graph
 
 logger = init_logger(__name__)
 
-from torch._dynamo import disable as dynamo_disable
 
 # will fix it by df11 plugin
 try:
@@ -79,7 +79,7 @@ def apply_df11_embedding(
     num_embeddings: int,
     embedding_dim: int,
     dtype: Optional[torch.dtype] = None,
-):
+) -> torch.Tensor:
     # Decode to a scratch vector then gather embeddings
     assert dfloat11_decode_v2 is not None, "DF11 extension missing at runtime"
     device = encoded_exponent.device
@@ -109,15 +109,105 @@ def apply_df11_embedding(
     return torch.embedding(weight_2d.to(dtype), indices)
 
 try:
+    def fake_df11_embedding(
+        indices: torch.Tensor,
+        luts: torch.Tensor,
+        encoded_exponent: torch.Tensor,
+        sign_mantissa: torch.Tensor,
+        output_positions: torch.Tensor,
+        gaps: torch.Tensor,
+        threads_per_block: int,
+        bytes_per_thread: int,
+        shared_mem_size: int,
+        num_embeddings: int,
+        embedding_dim: int,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        # Create a fake output tensor with the correct shape and dtype for Dynamo
+        # This follows the same way as vLLM's models
+        out_dtype = dtype or torch.bfloat16
+        # Support arbitrary-shaped indices; append embedding_dim as last dim
+        out_shape = tuple(list(indices.shape) + [int(embedding_dim)])
+        # Allocate on the same device as indices
+        return torch.empty(out_shape, dtype=out_dtype, device=indices.device)
+
     direct_register_custom_op(
         op_name="apply_df11_embedding",
         op_func=apply_df11_embedding,
         mutates_args=[],
+        fake_impl=fake_df11_embedding,
     )
     apply_df11_embedding_op = torch.ops.vllm.apply_df11_embedding
-except Exception as e:
+except Exception as e:  # pragma: no cover
     logger.warning("DF11: failed to register custom embedding op: %s", e)
     apply_df11_embedding_op = None
+
+
+# Linear decode custom op (decodes to a 1D bf16 tensor)
+def df11_decode(
+    luts: torch.Tensor,
+    encoded_exponent: torch.Tensor,
+    sign_mantissa: torch.Tensor,
+    output_positions: torch.Tensor,
+    gaps: torch.Tensor,
+    threads_per_block: int,
+    bytes_per_thread: int,
+    shared_mem_size: int,
+    n_elements: int,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    assert dfloat11_decode_v2 is not None, "DF11 extension missing at runtime"
+    device = encoded_exponent.device
+    n_bytes = encoded_exponent.numel()
+    n_luts = int(luts.shape[0])
+    out = TensorManager.get(device, int(n_elements))
+    threads = int(threads_per_block)
+    blocks = int(math.ceil(n_bytes / (threads * int(bytes_per_thread))))
+    dfloat11_decode_v2.decode(
+        luts.data_ptr(),
+        encoded_exponent.data_ptr(),
+        sign_mantissa.data_ptr(),
+        output_positions.data_ptr(),
+        gaps.data_ptr(),
+        out.data_ptr(),
+        n_luts,
+        n_bytes,
+        int(n_elements),
+        blocks,
+        threads,
+        int(shared_mem_size),
+    )
+    if dtype is not None and out.dtype != dtype:
+        return out.to(dtype)
+    return out
+
+
+def fake_df11_decode(
+    luts: torch.Tensor,
+    encoded_exponent: torch.Tensor,
+    sign_mantissa: torch.Tensor,
+    output_positions: torch.Tensor,
+    gaps: torch.Tensor,
+    threads_per_block: int,
+    bytes_per_thread: int,
+    shared_mem_size: int,
+    n_elements: int,
+    dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    fake_dtype = dtype or torch.bfloat16
+    return torch.empty((int(n_elements), ), dtype=fake_dtype, device=encoded_exponent.device)
+
+try:
+    direct_register_custom_op(
+        op_name="df11_decode",
+        op_func=df11_decode,
+        mutates_args=[],
+        fake_impl=fake_df11_decode,
+    )
+    df11_decode_op = torch.ops.vllm.df11_decode
+except Exception as e:  # pragma: no cover
+    logger.warning("DF11: failed to register decode op: %s", e)
+    df11_decode_op = None
 
 
 class TensorManager:
@@ -125,7 +215,7 @@ class TensorManager:
     buffers = {}
 
     @staticmethod
-    def get(device: torch.device, n_elements: int):
+    def get(device: torch.device, n_elements: int) -> torch.Tensor:
         if isinstance(device, str):
             device = torch.device(device)
         buf = TensorManager.buffers.get(device)
@@ -134,29 +224,27 @@ class TensorManager:
             TensorManager.buffers[device] = buf
         return buf[:n_elements]
 
-
-
 class DF11Config(QuantizationConfig):
     """Placeholder config
     Here, we will add df11 config -> load_format="df11"
     """
 
-    def get_name(self) -> str: 
+    def get_name(self) -> str:  # type: ignore[override]
         return "df11"
 
-    def get_supported_act_dtypes(self) -> list[torch.dtype]:
+    def get_supported_act_dtypes(self) -> list[torch.dtype]:  # type: ignore[override]
         return [torch.float16, torch.bfloat16]
 
     @classmethod
-    def get_min_capability(cls) -> int:
+    def get_min_capability(cls) -> int:  # type: ignore[override]
         return 70
 
     @staticmethod
-    def get_config_filenames() -> list[str]:
+    def get_config_filenames() -> list[str]:  # type: ignore[override]
         return []
 
     @classmethod
-    def from_config(cls, config: dict) -> "DF11Config":
+    def from_config(cls, config: dict) -> "DF11Config":  # type: ignore[override]
         return cls()
 
     # We do not use global get_quant_method for DF11; loader assigns methods.
@@ -176,9 +264,13 @@ class DF11LinearMethod(LinearMethodBase):
         self.threads_per_block = tuple(threads_per_block)
         self.bytes_per_thread = int(bytes_per_thread)
 
-    def create_weights(self, layer: torch.nn.Module, *args, **kwargs):
-        # Do not materialize dense weights for DF11 layers.
-    
+    def create_weights(self, layer):
+        """Do not materialize dense weights for DF11 layers.
+
+        Keeping a dummy attribute avoids downstream assumptions. We register a
+        tiny non-trainable Parameter to satisfy potential hasattr checks,
+        but DF11 apply() ignores it.
+        """
         if not hasattr(layer, "weight"):
             layer.register_parameter(
                 "weight",
@@ -186,22 +278,29 @@ class DF11LinearMethod(LinearMethodBase):
                           requires_grad=False),
             )
 
-    @dynamo_disable
-    def decode_into(self, layer: torch.nn.Module):
-        assert dfloat11_decode_v2 is not None, \
-            "DF11 CUDA extension is not available"
-
-        # All buffers must already be on the correct device
+    def decode_into(self, layer) :
+        # Use the custom op so Dynamo can trace with a fake implementation
+        n_elements = int(layer.sign_mantissa.numel())
+        if df11_decode_op is not None:
+            return df11_decode_op(
+                layer.luts,
+                layer.encoded_exponent,
+                layer.sign_mantissa,
+                layer.output_positions,
+                layer.gaps,
+                int(self.threads_per_block[0]),
+                int(self.bytes_per_thread),
+                int(layer.shared_mem_size),
+                int(n_elements),
+                torch.bfloat16,
+            )
+        # Fallback to direct extension
+        assert dfloat11_decode_v2 is not None, "DF11 CUDA extension is not available"
         device = layer.encoded_exponent.device
-        n_elements = layer.sign_mantissa.numel()
+        out = TensorManager.get(device, n_elements)
         n_bytes = layer.encoded_exponent.numel()
         n_luts = layer.luts.shape[0]
-
-        out = TensorManager.get(device, n_elements)
-
-        blocks_per_grid = int(
-            math.ceil(n_bytes / (self.threads_per_block[0] * self.bytes_per_thread)))
-
+        blocks_per_grid = int(math.ceil(n_bytes / (self.threads_per_block[0] * self.bytes_per_thread)))
         dfloat11_decode_v2.decode(
             layer.luts.data_ptr(),
             layer.encoded_exponent.data_ptr(),
@@ -219,8 +318,9 @@ class DF11LinearMethod(LinearMethodBase):
         return out
 
     @dynamo_disable
+    @dynamo_allow_in_graph
     def apply(self, layer: torch.nn.Module, x: torch.Tensor,
-              bias: Optional[torch.Tensor] = None):
+              bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Decode compressed weight to scratch and GEMM.
         decoded = self.decode_into(layer)
 
@@ -232,6 +332,7 @@ class DF11LinearMethod(LinearMethodBase):
             out_features = int(layer.out_features)
             in_features = int(layer.in_features)
         else:
+            # Fallback to square root-based guess; should not happen for vLLM
             in_features = x.shape[-1]
             out_features = decoded.numel() // in_features
 
@@ -244,8 +345,7 @@ class DF11LinearMethod(LinearMethodBase):
 class DF11EmbeddingMethod(DF11LinearMethod):
     """Embedding method for DF11 that supports both embedding() and apply()."""
 
-    def embedding(self, layer: VocabParallelEmbedding,
-                  indices: torch.Tensor):
+    def embedding(self, layer: VocabParallelEmbedding, indices: torch.Tensor):
         # Use a lightweight custom op wrapper to avoid Dynamo stepping into
         # Python decoding code paths. The op itself calls DF11 decode and then
         # performs embedding gather.
@@ -288,8 +388,73 @@ class DF11LinearSplitMethod(DF11LinearMethod):
         self._end = int(end_index)
 
     @dynamo_disable
-    def decode_into(self, layer: torch.nn.Module):
+    def decode_into(self, layer: torch.nn.Module) -> torch.Tensor:  # type: ignore[override]
+        # Decode using parent buffers, then slice the flat vector
         full = super().decode_into(self._parent)
         return full[self._start:self._end]
 
 
+
+# Helper used by V1 layers to avoid inlining DF11LinearMethod.apply
+def df11_apply_linear(layer: torch.nn.Module, x: torch.Tensor,
+                      bias: Optional[torch.Tensor]) -> torch.Tensor:
+    # Decode using the df11 custom op path (also works with fake tensors)
+    # Avoid calling any decode_into bound methods to keep Dynamo happy.
+    method = getattr(layer, "quant_method", None)
+    # Determine source module for buffers (parent for split method)
+    src = getattr(method, "_parent", layer)
+    # Total elements to decode from source
+    n_elements = int(src.sign_mantissa.numel())
+    if df11_decode_op is not None:
+        full = df11_decode_op(
+            src.luts,
+            src.encoded_exponent,
+            src.sign_mantissa,
+            src.output_positions,
+            src.gaps,
+            int(method.threads_per_block[0] if hasattr(method, "threads_per_block") else 256),
+            int(method.bytes_per_thread if hasattr(method, "bytes_per_thread") else 16),
+            int(src.shared_mem_size),
+            int(n_elements),
+            torch.bfloat16,
+        )
+    else:
+        # Fallback to extension decode
+        assert dfloat11_decode_v2 is not None, "DF11 CUDA extension is not available"
+        device = src.encoded_exponent.device
+        full = TensorManager.get(device, n_elements)
+        n_bytes = src.encoded_exponent.numel()
+        n_luts = src.luts.shape[0]
+        threads = int(method.threads_per_block[0])
+        blocks = int(math.ceil(n_bytes / (threads * int(method.bytes_per_thread))))
+        dfloat11_decode_v2.decode(
+            src.luts.data_ptr(),
+            src.encoded_exponent.data_ptr(),
+            src.sign_mantissa.data_ptr(),
+            src.output_positions.data_ptr(),
+            src.gaps.data_ptr(),
+            full.data_ptr(),
+            n_luts,
+            n_bytes,
+            n_elements,
+            blocks,
+            threads,
+            int(src.shared_mem_size),
+        )
+    # Slice if split method
+    if hasattr(method, "_start") and hasattr(method, "_end"):
+        decoded = full[int(method._start):int(method._end)]
+    else:
+        decoded = full
+    # Infer 2D weight shape
+    if hasattr(layer, "output_size") and hasattr(layer, "input_size"):
+        out_features = int(layer.output_size)
+        in_features = int(layer.input_size)
+    elif hasattr(layer, "out_features") and hasattr(layer, "in_features"):
+        out_features = int(layer.out_features)
+        in_features = int(layer.in_features)
+    else:
+        in_features = x.shape[-1]
+        out_features = decoded.numel() // in_features
+    weight_2d = decoded.view(out_features, in_features)
+    return dispatch_unquantized_gemm()(layer, x, weight_2d, bias)

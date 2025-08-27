@@ -23,6 +23,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization.df11 import (
     DF11LinearMethod, DF11EmbeddingMethod, DF11LinearSplitMethod)
+from vllm.model_executor.layers.quantization.df11 import df11_apply_linear
 
 logger = init_logger(__name__)
 
@@ -295,6 +296,12 @@ class DF11ModelLoader(BaseModelLoader):
                         threads_per_block=threads_per_block,
                         bytes_per_thread=bytes_per_thread,
                     )
+                   
+                    # for V1 compilation.
+                    try:
+                        module.quant_method.apply = df11_apply_linear
+                    except Exception:
+                        pass
                     if hasattr(module, "weight"):
                         try:
                             delattr(module, "weight")
@@ -401,6 +408,10 @@ class DF11ModelLoader(BaseModelLoader):
                                         start_index=start_elem,
                                         end_index=end_elem,
                                     )
+                                    try:
+                                        target.quant_method.apply = df11_apply_linear
+                                    except Exception:
+                                        pass
                                     if hasattr(target, "weight"):
                                         try:
                                             delattr(target, "weight")
@@ -415,6 +426,10 @@ class DF11ModelLoader(BaseModelLoader):
                             threads_per_block=threads_per_block,
                             bytes_per_thread=bytes_per_thread,
                         )
+                        try:
+                            module.quant_method.apply = df11_apply_linear
+                        except Exception:
+                            pass
 
         logger.info("DF11 weights registered and DF11 methods assigned")
 
@@ -466,7 +481,7 @@ class DF11ModelLoader(BaseModelLoader):
     def prepare_weight_injection(module: nn.Module, layer_path: str, pattern_dict: Dict[str, List[str]]):
         logger.debug(f"DF11: Preparing weight injection for {layer_path}, module type: {type(module).__name__}")
         
-        # Find pattern match
+        # Find pattern match (if any)
         matched_attrs: List[str] | None = None
         for pattern, attrs in pattern_dict.items():
             if re.fullmatch(pattern, layer_path):
